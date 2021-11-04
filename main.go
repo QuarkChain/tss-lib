@@ -10,6 +10,7 @@ import (
 
 	"github.com/binance-chain/tss-lib/common"
 	"github.com/binance-chain/tss-lib/ecdsa/keygen"
+	"github.com/binance-chain/tss-lib/ecdsa/resharing"
 	"github.com/binance-chain/tss-lib/ecdsa/signing"
 	"github.com/binance-chain/tss-lib/tss"
 	s256k1 "github.com/btcsuite/btcd/btcec"
@@ -28,12 +29,7 @@ type (
 	}
 )
 
-const (
-	threshold = 1
-	nparty    = 3
-)
-
-func startKeygen() (tss.SortedPartyIDs, []*keygen.LocalPartySaveData) {
+func startKeygen(nparty int, threshold int) (tss.SortedPartyIDs, []*keygen.LocalPartySaveData) {
 	tss.SetCurve(s256k1.S256())
 
 	// Create a `*PartyID` for each participating peer on the network (you should call `tss.NewPartyID` for each one)
@@ -221,7 +217,7 @@ func startSigning(allPartyIds tss.SortedPartyIDs, enable []bool, allLocalDataLis
 	}
 
 	for i := 0; i < len(partyIds); i++ {
-		params := tss.NewParameters(s256k1.S256(), ctx, partyIds[i], len(partyIds), threshold)
+		params := tss.NewParameters(s256k1.S256(), ctx, partyIds[i], len(partyIds), active-1)
 		endCh := make(chan common.SignatureData)
 		go func(id string, chn chan common.SignatureData) {
 			for data := range endCh {
@@ -268,14 +264,13 @@ func startSigning(allPartyIds tss.SortedPartyIDs, enable []bool, allLocalDataLis
 			}
 
 			recoveredAddr := crypto.PubkeyToAddress(*rpk)
-			fmt.Printf("Party %s, recovery addr %s\n", data.partyId, hex.EncodeToString(recoveredAddr[:]))
+			fmt.Printf("Party %s, recovery addr 0x%s\n", data.partyId, hex.EncodeToString(recoveredAddr[:]))
 
 			nkeySigned++
 
 			if nkeySigned == active {
 				return
 			}
-			// return //signer, nil
 		case outMsg := <-outCh:
 			fmt.Println("get signing message", outMsg)
 
@@ -285,9 +280,6 @@ func startSigning(allPartyIds tss.SortedPartyIDs, enable []bool, allLocalDataLis
 
 			if routing.IsBroadcast {
 				for i := 0; i < len(partyIds); i++ {
-					if parties[i].PartyID() == senderPartyID {
-						continue
-					}
 					go func(party tss.Party, bytes []byte, senderPartyID *tss.PartyID) {
 						// fmt.Printf("updating %s\n", party.PartyID().GetId())
 						ok, err := party.UpdateFromBytes(
@@ -327,12 +319,167 @@ func startSigning(allPartyIds tss.SortedPartyIDs, enable []bool, allLocalDataLis
 	}
 }
 
+func startResharing(partyIds tss.SortedPartyIDs, localDataList []*keygen.LocalPartySaveData, oldThreshold int, newNparty int, newThreshold int) (tss.SortedPartyIDs, []*keygen.LocalPartySaveData) {
+	for i := 0; i < len(partyIds); i++ {
+		partyIds[i].Index = i
+	}
+
+	ctx := tss.NewPeerContext(partyIds)
+
+	outCh := make(chan tss.Message, 20)
+	endChAggr := make(chan PartyData)
+
+	newPartyIds := tss.GenerateTestPartyIDs(newNparty, 100)
+	for i, partyId := range newPartyIds {
+		partyId.Index = i
+	}
+	newParties := make([]tss.Party, newNparty)
+	newCtx := tss.NewPeerContext(newPartyIds)
+
+	parties := make([]tss.Party, len(partyIds))
+	allParties := make([]tss.Party, 0)
+
+	hash := make([]byte, 32)
+	for i := 0; i < len(hash); i++ {
+		hash[i] = byte(i)
+	}
+
+	for i := 0; i < len(partyIds); i++ {
+		params := tss.NewReSharingParameters(s256k1.S256(), ctx, newCtx, partyIds[i], len(partyIds), oldThreshold, newNparty, newThreshold)
+		endCh := make(chan keygen.LocalPartySaveData)
+		go func(id string, chn chan keygen.LocalPartySaveData) {
+			for data := range endCh {
+				endChAggr <- PartyData{partyId: id, localPartySaveData: &data}
+			}
+		}(partyIds[i].Id, endCh)
+		parties[i] = resharing.NewLocalParty(params, *localDataList[i], outCh, endCh)
+		allParties = append(allParties, parties[i])
+	}
+
+	for i := 0; i < newNparty; i++ {
+		params := tss.NewReSharingParameters(s256k1.S256(), ctx, newCtx, newPartyIds[i], len(partyIds), oldThreshold, newNparty, newThreshold)
+		endCh := make(chan keygen.LocalPartySaveData)
+		go func(id string, chn chan keygen.LocalPartySaveData) {
+			for data := range endCh {
+				endChAggr <- PartyData{partyId: id, localPartySaveData: &data}
+			}
+		}(newPartyIds[i].Id, endCh)
+		newParties[i] = resharing.NewLocalParty(params, keygen.NewLocalPartySaveData(newNparty), outCh, endCh)
+		allParties = append(allParties, newParties[i])
+	}
+
+	partyIDMap := make(map[string]*tss.PartyID)
+	partyMap := make(map[string]tss.Party)
+	for _, party := range allParties {
+		partyIDMap[party.PartyID().Id] = party.PartyID()
+		partyMap[party.PartyID().Id] = party
+	}
+
+	for _, party := range allParties {
+		go func(party tss.Party) {
+			fmt.Printf("Starting resharing %s\n", party.PartyID())
+			if err := party.Start(); err != nil {
+				println(err)
+			}
+		}(party)
+	}
+
+	nkeyGenerated := 0
+	allSavedData := make([]*keygen.LocalPartySaveData, newNparty)
+
+	for {
+		select {
+		case data := <-endChAggr:
+			curve := tss.EC()
+			keygenData := data.localPartySaveData
+			fmt.Printf("Party %s, get keygenData\n", data.partyId)
+			if keygenData == nil || keygenData.ECDSAPub == nil {
+				continue
+			}
+			pkX, pkY := keygenData.ECDSAPub.X(), keygenData.ECDSAPub.Y()
+			publicKey := ecdsa.PublicKey{
+				Curve: curve,
+				X:     pkX,
+				Y:     pkY,
+			}
+
+			ethPublicKey := crypto.PubkeyToAddress(publicKey)
+			fmt.Printf("Party %s, eth Public key %s \n", data.partyId, ethPublicKey)
+			nkeyGenerated++
+			for i := 0; i < newNparty; i++ {
+				if newParties[i].PartyID().Id == data.partyId {
+					allSavedData[i] = data.localPartySaveData
+					break
+				}
+			}
+
+			if nkeyGenerated == newNparty {
+				return newPartyIds, allSavedData
+			}
+			// return //signer, nil
+		case outMsg := <-outCh:
+			fmt.Println("get keygen message", outMsg)
+
+			bytes, routing, _ := outMsg.WireBytes()
+
+			senderPartyID := partyIDMap[routing.From.GetId()]
+
+			var partySet []tss.Party
+
+			if routing.IsToOldCommittee {
+				partySet = parties
+			} else if !routing.IsToOldAndNewCommittees {
+				partySet = newParties
+			} else {
+				partySet = allParties
+			}
+
+			if routing.IsBroadcast {
+				for _, party := range partySet {
+					go func(party tss.Party, bytes []byte, senderPartyID *tss.PartyID) {
+						// fmt.Printf("updating %s\n", party.PartyID().GetId())
+						ok, err := party.UpdateFromBytes(
+							bytes,
+							senderPartyID,
+							true,
+						)
+						if !ok || err != nil {
+							fmt.Println("error", err)
+						}
+					}(party, bytes, senderPartyID)
+				}
+			} else {
+				for _, id := range routing.To {
+					go func(party tss.Party, bytes []byte, senderPartyID *tss.PartyID) {
+						// fmt.Printf("updating %s\n", party.PartyID().GetId())
+						ok, err := party.UpdateFromBytes(
+							bytes,
+							senderPartyID,
+							false,
+						)
+						if !ok || err != nil {
+							fmt.Println("error", err)
+						}
+					}(partyMap[id.GetId()], bytes, senderPartyID)
+				}
+			}
+		}
+	}
+}
+
 func main() {
-	partyIds, localData := startKeygen()
+	partyIds, localData := startKeygen(3, 1)
 
-	startSigning(partyIds, []bool{true, true, false}, localData)
+	// startSigning(partyIds, []bool{true, true, false}, localData)
 
-	startSigning(partyIds, []bool{false, true, true}, localData)
+	// startSigning(partyIds, []bool{false, true, true}, localData)
 
-	startSigning(partyIds, []bool{true, false, true}, localData)
+	// startSigning(partyIds, []bool{true, false, true}, localData)
+
+	newPartyIds, newLocalData := startResharing(partyIds, localData, 1, 4, 2)
+	if newPartyIds == nil || newLocalData == nil {
+		fmt.Println("Resharing failed")
+	}
+
+	startSigning(newPartyIds, []bool{true, false, true, true}, newLocalData)
 }
